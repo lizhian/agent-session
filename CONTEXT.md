@@ -52,6 +52,46 @@ _Avoid_: Page, mode
 A **Picker view** for provider-specific actions that change the selected **Agent provider** configuration.
 _Avoid_: Settings screen, right-click menu
 
+**Manager hub**:
+A global **Picker view** reached from the session list that groups cross-provider management entries such as skills management.
+_Avoid_: Settings screen, provider config page
+
+**Manager entry**:
+A selectable row inside the **Manager hub** that opens one cross-provider management workflow.
+_Avoid_: Configuration action, provider setting
+
+**Global skills view**:
+A **Picker view** for selecting which **Installed skills** are enabled in the global user scope.
+_Avoid_: Source detail, provider config
+
+**Skill installation repository**:
+A local storage directory owned by Agent Session where installed skills are kept independently from whether they are enabled globally or for one project.
+_Avoid_: Global skills dir, provider dir
+
+**Skill source**:
+An installable upstream source that can yield one or more installed skills.
+_Avoid_: Installed skill, activation target
+
+**Skill source directory name**:
+The filesystem-safe directory name derived from one **Skill source** for storage inside the **Skill installation repository**.
+_Avoid_: Installed skill name, local alias
+
+**Installed skill**:
+A single skill materialized inside the **Skill installation repository** and identified independently from the **Skill source** that produced it.
+_Avoid_: Source repo, link target
+
+**Installed skill description**:
+A short summary string associated with one **Installed skill** and used for picker display.
+_Avoid_: Source description, skill body
+
+**Installed skill catalog**:
+A local Agent Session record that tracks installed skills and their activation state across scopes.
+_Avoid_: Source manifest, provider config
+
+**Skill activation target**:
+A directory that receives symlinks to installed skills so they become active in one scope, such as the global user scope or the current project scope.
+_Avoid_: Install dir, copy target
+
 **Configuration action**:
 A selectable operation in the **Configurations view**, such as choosing a **Model provider** or editing model selections.
 _Avoid_: Setting row
@@ -114,10 +154,24 @@ _Avoid_: Permission mode
 - Pi Coding Agent launches use the selected **Session directory** so reopening a **Session** resolves against the same storage used by discovery.
 - Pi Coding Agent launches use the selected configuration directory through `PI_CODING_AGENT_DIR`.
 - A **Session picker** starts in the session list and can navigate to **Workspaces**, the **Configurations view**, and **Session preview**.
+- Pressing Left from the session list opens the **Manager hub**.
 - A **Session preview** loads a **Conversation transcript** lazily for the selected **Session**.
 - A **Conversation transcript** includes useful user and assistant messages, not tool calls or internal records.
 - A **Conversation message preview** limits one message body to 500 non-whitespace Unicode runes by keeping the first 250 and last 250 non-whitespace runes while preserving original whitespace.
 - A **Configurations view** belongs to the current **Agent provider**.
+- A **Manager hub** is shared by all **Public commands** and is not owned by any one **Agent provider**.
+- A **Manager entry** opens a cross-provider workflow from the **Manager hub**.
+- A **Global skills view** manages activation of **Installed skills** in the global user scope.
+- A **Skill source** may produce one or more **Installed skills**.
+- A **Skill source directory name** is derived from a **Skill source** for local storage.
+- An **Installed skill** is stored independently from the **Skill source** that produced it.
+- An **Installed skill** may have one **Installed skill description**.
+- A **Skill installation repository** stores installed skills once for Agent Session.
+- A **Skill installation repository** stores **Installed skills**, not raw **Skill sources**.
+- A **Skill installation repository** may group **Installed skills** under one **Skill source directory name** per **Skill source**.
+- An **Installed skill catalog** records Agent Session-owned metadata for installed skills, including each **Installed skill description** when available.
+- Updating a **Skill source** mirrors the source's current **Installed skills** into the **Skill installation repository** and the **Installed skill catalog**, removing previously installed skills that no longer exist in the source.
+- A **Skill activation target** enables a skill by symlinking from the **Skill installation repository** into a scope-specific directory.
 - A **Configuration action** may show direct **Configuration items** or a **Multi-select configuration list**.
 - Claude Code and Codex expose **Model provider** selection as a **Configuration action**.
 - OpenCode exposes `@ai-sdk/*` provider model lists, default model, and small model as **Configuration actions**.

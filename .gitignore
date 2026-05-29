@@ -5,3 +5,4 @@ coverage/
 .idea/
 /agent-session
 dist/
+.mindfs

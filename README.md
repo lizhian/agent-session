@@ -16,6 +16,7 @@ Claude Code、Codex、OpenCode 与 Pi Coding Agent 的交互式 session 选择�
 - 使用 `Tab` 切换权限模式，并记住上次选择。
 - 通过工作区视图切换到其他项目目录。
 - 在选择器内配置模型 provider、默认模型和 provider 相关模型列表。
+- 从 session 列表按 `Left` 进入全局 manager，管理 skills 安装源、全局启用和当前项目启用。
 - 单二进制 + 命令分发：`c`/`cx`/`oc`/`p` -> `agent-session`。
 - 零运行时依赖：运行时不需要 Node.js、sqlite3 或 Go。
 
@@ -77,9 +78,22 @@ agent-session p
 - `Space`：在 session 列表中预览 transcript；在多选配置中切换选中状态。
 - `Tab`：在 session 列表中切换权限模式。
 - `Right` 或 `l`：从 session 列表进入工作区视图；从工作区视图进入配置视图。
-- `Left` 或 `h`：返回上一层。
+- `Left` 或 `h`：从 session 列表进入 manager，或返回上一层。
 - `Esc`：返回上一层；在 session 列表中退出。
 - `Ctrl-C`：退出。
+
+## Skills manager
+
+在 session 列表中按 `Left` 进入 manager，再进入 `Skills manager`。
+
+- `Install source`：输入 `owner/repo` 形式的 GitHub source，通过 `npx skills add <source>` 安装到 Agent Session 自己的 skills 仓库。
+- `Global skills`：按 source 分组显示所有已安装 skills，`Space` 暂存选中，`Enter` 批量保存到 `~/.agents/skills`。
+- `Project skills`：按 source 分组显示所有已安装 skills，`Space` 暂存选中，`Enter` 批量保存到当前项目的 `/.agents/skills`。
+- 已安装 source 详情：支持镜像更新和删除 source；更新会同步移除 source 中已不存在的 skill，并自动清理对应全局/项目软链。
+
+Agent Session 把 skills 安装仓库保存在 `~/.agent-session/skills/`，并使用 `~/.agent-session/install-skills.json` 作为权威 catalog。启用状态通过软链投影到全局或当前项目目录。
+
+使用 `Skills manager` 需要本机可运行 `npx skills`。
 
 ### 权限模式
 

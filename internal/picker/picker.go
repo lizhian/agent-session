@@ -3,15 +3,18 @@ package picker
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 	"unicode"
 
+	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/lizhian/agent-session/internal/provider"
 	"github.com/lizhian/agent-session/internal/render"
 	"github.com/lizhian/agent-session/internal/session"
+	"github.com/lizhian/agent-session/internal/skills"
 )
 
 // View represents the current screen in the picker state machine.
@@ -27,7 +30,53 @@ const (
 	ViewConfigurations
 	ViewConfigurationItems
 	ViewConfigurationSubitems
+	ViewManagerHub
+	ViewSkillsManager
+	ViewSkillsInstallInput
+	ViewSkillsGlobal
+	ViewSkillsProject
+	ViewSkillSourceDetail
+	ViewSkillSourceRemoveConfirm
 )
+
+type skillScope int
+
+const (
+	skillScopeGlobal skillScope = iota
+	skillScopeProject
+)
+
+type managerItem struct {
+	Label string
+	Kind  string
+}
+
+type skillManagerItem struct {
+	Label      string
+	Kind       string
+	SourceSafe string
+	Source     string
+}
+
+type skillSelectionItem struct {
+	Label       string
+	Description string
+	Kind        string
+	Source      string
+	SourceSafe  string
+	SkillName   string
+	LinkName    string
+	Selected    bool
+}
+
+type skillSourceDetailItem struct {
+	Label       string
+	Description string
+	Kind        string
+	SourceSafe  string
+	Source      string
+	SkillName   string
+}
 
 // Model is the bubbletea Model for the interactive session picker.
 type Model struct {
@@ -37,14 +86,21 @@ type Model struct {
 	view       View
 
 	// Navigation state.
-	sessionSelectedIndex    int
-	workspaceSelectedIndex  int
-	configSelectedIndex     int
-	configItemSelectedIndex int
+	sessionSelectedIndex     int
+	workspaceSelectedIndex   int
+	configSelectedIndex      int
+	configItemSelectedIndex  int
+	managerSelectedIndex     int
+	skillsSelectedIndex      int
+	skillDetailSelectedIndex int
+	skillRemoveSelectedIndex int
 
 	// Search queries.
-	sessionQuery   string
-	workspaceQuery string
+	sessionQuery    string
+	workspaceQuery  string
+	skillsInput     string
+	skillsCursor    int
+	skillsTextInput textinput.Model
 
 	// Permission mode.
 	permissionMode string
@@ -61,6 +117,21 @@ type Model struct {
 	activeItem     *provider.ConfigItem
 	activeSubitems *provider.SubitemConfigAction
 	configStatus   string
+
+	// Skills manager state.
+	skillsStore             *skills.Store
+	skillsCatalog           skills.Catalog
+	skillsManagerStatus     string
+	skillSelectionStatus    string
+	skillDetailStatus       string
+	skillRemoveStatus       string
+	managerItems            []managerItem
+	skillManagerItems       []skillManagerItem
+	skillSelectionItems     []skillSelectionItem
+	skillSelectionScope     skillScope
+	selectedSkillSourceSafe string
+	skillSourceDetailItems  []skillSourceDetailItem
+	skillRemoveImpact       skills.RemoveSourceImpact
 
 	// Preview state.
 	previewTranscript []provider.TranscriptMessage
@@ -82,7 +153,7 @@ type Model struct {
 
 // NewModel creates a new picker model.
 func NewModel(p provider.Provider, sessions []provider.Session, cwd, permissionMode string, width, height int, useColor bool) Model {
-	return Model{
+	model := Model{
 		provider:             p,
 		sessions:             sessions,
 		view:                 ViewSessions,
@@ -94,14 +165,31 @@ func NewModel(p provider.Provider, sessions []provider.Session, cwd, permissionM
 		height:               height,
 		useColor:             useColor,
 		configActions:        p.ConfigurationActions(),
+		skillsStore:          skills.NewStore(""),
 	}
+	model.initSkillsTextInput()
+	return model
 }
 
 func (m Model) Init() tea.Cmd {
-	return nil
+	return textinput.Blink
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	if m.view == ViewSkillsInstallInput {
+		if keyMsg, ok := msg.(tea.KeyMsg); ok {
+			switch keyMsg.String() {
+			case "esc", "enter", "return", "up", "k", "down", "j":
+				// Let the picker-level handlers manage navigation and submit.
+			default:
+				var cmd tea.Cmd
+				m.skillsTextInput, cmd = m.skillsTextInput.Update(msg)
+				m.syncSkillsInputFromTextInput()
+				return m, cmd
+			}
+		}
+	}
+
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
@@ -158,6 +246,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.handleRight()
 		case "backspace":
 			return m.handleBackspace()
+		case "delete":
+			return m.handleBackspace()
 		default:
 			if m.view == ViewTerminalPreview {
 				if len(msg.Runes) == 1 && (msg.Runes[0] == 'q' || msg.Runes[0] == 'Q') {
@@ -165,9 +255,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				return m, nil
 			}
-			// Printable characters go to the search query.
-			if len(msg.Runes) == 1 && msg.Runes[0] >= 32 && msg.Runes[0] < 127 {
-				return m.handleChar(msg.Runes[0])
+			// Forward any printable text, including pasted strings and IME commits.
+			if len(msg.Runes) > 0 {
+				return m.handleText(string(msg.Runes))
 			}
 		}
 	}
@@ -195,6 +285,18 @@ func (m Model) View() string {
 		return m.renderConfigurationItems()
 	case ViewConfigurationSubitems:
 		return m.renderConfigurationSubitems()
+	case ViewManagerHub:
+		return m.renderManagerHub()
+	case ViewSkillsManager:
+		return m.renderSkillsManager()
+	case ViewSkillsInstallInput:
+		return m.renderSkillsInstallInput()
+	case ViewSkillsGlobal, ViewSkillsProject:
+		return m.renderSkillSelectionView()
+	case ViewSkillSourceDetail:
+		return m.renderSkillSourceDetail()
+	case ViewSkillSourceRemoveConfirm:
+		return m.renderSkillSourceRemoveConfirm()
 	}
 	return ""
 }
@@ -202,6 +304,29 @@ func (m Model) View() string {
 // Result returns the picker result after the program exits.
 func (m Model) Result() *provider.PickResult {
 	return m.result
+}
+
+func (m *Model) initSkillsTextInput() {
+	input := textinput.New()
+	input.Prompt = ""
+	input.Placeholder = "owner/repo"
+	input.CharLimit = 0
+	input.Focus()
+	input.SetValue(m.skillsInput)
+	input.SetCursor(len([]rune(m.skillsInput)))
+	m.skillsTextInput = input
+	m.syncSkillsInputFromTextInput()
+}
+
+func (m *Model) syncSkillsInputFromTextInput() {
+	m.skillsInput = m.skillsTextInput.Value()
+	m.skillsCursor = m.skillsTextInput.Position()
+}
+
+func (m *Model) syncTextInputFromSkillsInput() {
+	m.skillsTextInput.SetValue(m.skillsInput)
+	m.skillsTextInput.SetCursor(m.skillsCursor)
+	m.syncSkillsInputFromTextInput()
 }
 
 // --- Key handlers ---
@@ -277,6 +402,32 @@ func (m Model) handleEscape() (tea.Model, tea.Cmd) {
 	case ViewWorkspaces:
 		m.view = ViewSessions
 		return m, nil
+	case ViewManagerHub:
+		m.view = ViewSessions
+		return m, nil
+	case ViewSkillsManager:
+		m.view = ViewManagerHub
+		return m, nil
+	case ViewSkillsInstallInput:
+		m.view = ViewSkillsManager
+		m.skillsInput = ""
+		m.skillsCursor = 0
+		m.syncTextInputFromSkillsInput()
+		return m, nil
+	case ViewSkillsGlobal, ViewSkillsProject:
+		m.view = ViewSkillsManager
+		m.skillSelectionItems = nil
+		m.skillSelectionStatus = ""
+		return m, nil
+	case ViewSkillSourceDetail:
+		m.view = ViewSkillsManager
+		m.skillSourceDetailItems = nil
+		m.skillDetailStatus = ""
+		return m, nil
+	case ViewSkillSourceRemoveConfirm:
+		m.view = ViewSkillSourceDetail
+		m.skillRemoveStatus = ""
+		return m, nil
 	default:
 		m.quitting = true
 		m.result = nil
@@ -299,6 +450,18 @@ func (m Model) handleEnter() (tea.Model, tea.Cmd) {
 		return m.selectConfigurationItem()
 	case ViewConfigurationSubitems:
 		return m.selectConfigurationSubitems()
+	case ViewManagerHub:
+		return m.selectManagerItem()
+	case ViewSkillsManager:
+		return m.selectSkillsManagerItem()
+	case ViewSkillsInstallInput:
+		return m.installSkillSource()
+	case ViewSkillsGlobal, ViewSkillsProject:
+		return m.saveSkillSelection()
+	case ViewSkillSourceDetail:
+		return m.selectSkillSourceDetailItem()
+	case ViewSkillSourceRemoveConfirm:
+		return m.selectSkillSourceRemoveConfirmItem()
 	}
 	return m, nil
 }
@@ -332,6 +495,15 @@ func (m Model) handleSpace() (tea.Model, tea.Cmd) {
 			m.configSubitems[idx].Selected = !m.configSubitems[idx].Selected
 			if idx+1 < len(m.configSubitems) {
 				m.configItemSelectedIndex = idx + 1
+			}
+		}
+		return m, nil
+	case ViewSkillsGlobal, ViewSkillsProject:
+		idx := render.ClampSelectedIndex(m.skillsSelectedIndex, len(m.skillSelectionItems))
+		if idx < len(m.skillSelectionItems) && m.skillSelectionItems[idx].Kind == "skill" {
+			m.skillSelectionItems[idx].Selected = !m.skillSelectionItems[idx].Selected
+			for m.skillsSelectedIndex+1 < len(m.skillSelectionItems) && m.skillSelectionItems[m.skillsSelectedIndex+1].Kind == "header" {
+				m.skillsSelectedIndex++
 			}
 		}
 		return m, nil
@@ -375,9 +547,34 @@ func (m Model) handleUp() (tea.Model, tea.Cmd) {
 			m.configSelectedIndex--
 		}
 		return m, nil
+	case ViewManagerHub:
+		if m.managerSelectedIndex > 0 {
+			m.managerSelectedIndex--
+		}
+		return m, nil
+	case ViewSkillsManager:
+		if m.skillsSelectedIndex > 0 {
+			m.skillsSelectedIndex--
+		}
+		return m, nil
+	case ViewSkillsGlobal, ViewSkillsProject:
+		if idx := previousSelectableSkillIndex(m.skillSelectionItems, m.skillsSelectedIndex); idx != m.skillsSelectedIndex {
+			m.skillsSelectedIndex = idx
+		}
+		return m, nil
 	case ViewConfigurationItems, ViewConfigurationSubitems:
 		if m.configItemSelectedIndex > 0 {
 			m.configItemSelectedIndex--
+		}
+		return m, nil
+	case ViewSkillSourceDetail:
+		if m.skillDetailSelectedIndex > 0 {
+			m.skillDetailSelectedIndex--
+		}
+		return m, nil
+	case ViewSkillSourceRemoveConfirm:
+		if m.skillRemoveSelectedIndex > 0 {
+			m.skillRemoveSelectedIndex--
 		}
 		return m, nil
 	}
@@ -401,11 +598,26 @@ func (m Model) handleDown() (tea.Model, tea.Cmd) {
 	case ViewConfigurations:
 		m.configSelectedIndex = render.ClampSelectedIndex(m.configSelectedIndex+1, len(m.configActions))
 		return m, nil
+	case ViewManagerHub:
+		m.managerSelectedIndex = render.ClampSelectedIndex(m.managerSelectedIndex+1, len(m.currentManagerItems()))
+		return m, nil
+	case ViewSkillsManager:
+		m.skillsSelectedIndex = render.ClampSelectedIndex(m.skillsSelectedIndex+1, len(m.currentSkillsManagerItems()))
+		return m, nil
 	case ViewConfigurationItems:
 		m.configItemSelectedIndex = render.ClampSelectedIndex(m.configItemSelectedIndex+1, len(m.configItems))
 		return m, nil
 	case ViewConfigurationSubitems:
 		m.configItemSelectedIndex = render.ClampSelectedIndex(m.configItemSelectedIndex+1, len(m.configSubitems))
+		return m, nil
+	case ViewSkillsGlobal, ViewSkillsProject:
+		m.skillsSelectedIndex = nextSelectableSkillIndex(m.skillSelectionItems, m.skillsSelectedIndex)
+		return m, nil
+	case ViewSkillSourceDetail:
+		m.skillDetailSelectedIndex = render.ClampSelectedIndex(m.skillDetailSelectedIndex+1, len(m.skillSourceDetailItems))
+		return m, nil
+	case ViewSkillSourceRemoveConfirm:
+		m.skillRemoveSelectedIndex = render.ClampSelectedIndex(m.skillRemoveSelectedIndex+1, 2)
 		return m, nil
 	}
 	return m, nil
@@ -415,6 +627,11 @@ func (m Model) handleLeft() (tea.Model, tea.Cmd) {
 	switch m.view {
 	case ViewWorkspaces:
 		m.view = ViewSessions
+		return m, nil
+	case ViewSessions:
+		m.view = ViewManagerHub
+		m.managerSelectedIndex = 0
+		m.skillsManagerStatus = ""
 		return m, nil
 	case ViewConfigurations:
 		m.view = ViewWorkspaces
@@ -429,6 +646,25 @@ func (m Model) handleLeft() (tea.Model, tea.Cmd) {
 		return m, nil
 	case ViewConfigurationSubitems:
 		return m.cancelConfigurationSubitems()
+	case ViewSkillsManager:
+		m.view = ViewManagerHub
+		return m, nil
+	case ViewSkillsInstallInput:
+		if m.skillsCursor > 0 {
+			m.skillsCursor--
+			return m, nil
+		}
+		m.view = ViewSkillsManager
+		return m, nil
+	case ViewSkillsGlobal, ViewSkillsProject:
+		m.view = ViewSkillsManager
+		return m, nil
+	case ViewSkillSourceDetail:
+		m.view = ViewSkillsManager
+		return m, nil
+	case ViewSkillSourceRemoveConfirm:
+		m.view = ViewSkillSourceDetail
+		return m, nil
 	}
 	return m, nil
 }
@@ -461,6 +697,19 @@ func (m Model) handleRight() (tea.Model, tea.Cmd) {
 		m.configSelectedIndex = 0
 		m.configStatus = ""
 		return m, nil
+	case ViewManagerHub:
+		m.view = ViewSkillsManager
+		m.skillsSelectedIndex = 0
+		_ = m.refreshSkillsCatalog()
+		return m, nil
+	case ViewSkillsInstallInput:
+		cursorMax := len([]rune(m.skillsInput))
+		if m.skillsCursor < cursorMax {
+			m.skillsCursor++
+			return m, nil
+		}
+		m.view = ViewSkillsManager
+		return m, nil
 	}
 	return m, nil
 }
@@ -477,17 +726,44 @@ func (m Model) handleBackspace() (tea.Model, tea.Cmd) {
 			m.workspaceQuery = m.workspaceQuery[:len(m.workspaceQuery)-1]
 		}
 		return m, nil
+	case ViewSkillsInstallInput:
+		runes := []rune(m.skillsInput)
+		if m.skillsCursor > 0 && m.skillsCursor <= len(runes) {
+			runes = append(runes[:m.skillsCursor-1], runes[m.skillsCursor:]...)
+			m.skillsInput = string(runes)
+			m.skillsCursor--
+		}
+		return m, nil
 	}
 	return m, nil
 }
 
-func (m Model) handleChar(r rune) (tea.Model, tea.Cmd) {
+func (m Model) handleText(text string) (tea.Model, tea.Cmd) {
+	if text == "" {
+		return m, nil
+	}
 	switch m.view {
 	case ViewSessions:
-		m.sessionQuery += string(r)
+		m.sessionQuery += text
 		return m, nil
 	case ViewWorkspaces:
-		m.workspaceQuery += string(r)
+		m.workspaceQuery += text
+		return m, nil
+	case ViewSkillsInstallInput:
+		runes := []rune(m.skillsInput)
+		insert := []rune(text)
+		if m.skillsCursor < 0 {
+			m.skillsCursor = 0
+		}
+		if m.skillsCursor > len(runes) {
+			m.skillsCursor = len(runes)
+		}
+		updated := make([]rune, 0, len(runes)+len(insert))
+		updated = append(updated, runes[:m.skillsCursor]...)
+		updated = append(updated, insert...)
+		updated = append(updated, runes[m.skillsCursor:]...)
+		m.skillsInput = string(updated)
+		m.skillsCursor += len(insert)
 		return m, nil
 	}
 	return m, nil
@@ -691,6 +967,270 @@ func (m Model) selectConfigurationSubitems() (tea.Model, tea.Cmd) {
 	m.configSubitems = nil
 	m.configSelectedIndex = render.ClampSelectedIndex(m.configSelectedIndex, len(m.configActions))
 	return m, nil
+}
+
+func (m *Model) refreshSkillsCatalog() error {
+	catalog, err := m.skillsStore.LoadCatalog()
+	if err != nil {
+		m.skillsManagerStatus = err.Error()
+		return err
+	}
+	m.skillsCatalog = catalog
+	m.skillManagerItems = buildSkillsManagerItems(catalog)
+	return nil
+}
+
+func (m Model) selectManagerItem() (tea.Model, tea.Cmd) {
+	items := m.currentManagerItems()
+	idx := render.ClampSelectedIndex(m.managerSelectedIndex, len(items))
+	if idx >= len(items) {
+		return m, nil
+	}
+	item := items[idx]
+	if item.Kind == "skills" {
+		_ = m.refreshSkillsCatalog()
+		m.view = ViewSkillsManager
+		m.skillsSelectedIndex = 0
+	}
+	return m, nil
+}
+
+func (m Model) selectSkillsManagerItem() (tea.Model, tea.Cmd) {
+	items := m.currentSkillsManagerItems()
+	idx := render.ClampSelectedIndex(m.skillsSelectedIndex, len(items))
+	if idx >= len(items) {
+		return m, nil
+	}
+	item := items[idx]
+	switch item.Kind {
+	case "install":
+		m.view = ViewSkillsInstallInput
+		m.skillsInput = ""
+		m.skillsCursor = 0
+		m.syncTextInputFromSkillsInput()
+		m.skillsTextInput.Focus()
+		m.skillSelectionStatus = ""
+	case "global":
+		if err := m.refreshSkillsCatalog(); err != nil {
+			return m, nil
+		}
+		m.skillSelectionScope = skillScopeGlobal
+		m.skillSelectionItems = buildSkillSelectionItems(m.skillsCatalog, skillScopeGlobal, m.cwd)
+		m.skillsSelectedIndex = firstSelectableSkillIndex(m.skillSelectionItems)
+		m.skillSelectionStatus = ""
+		m.view = ViewSkillsGlobal
+	case "project":
+		if err := m.refreshSkillsCatalog(); err != nil {
+			return m, nil
+		}
+		m.skillSelectionScope = skillScopeProject
+		m.skillSelectionItems = buildSkillSelectionItems(m.skillsCatalog, skillScopeProject, m.cwd)
+		m.skillsSelectedIndex = firstSelectableSkillIndex(m.skillSelectionItems)
+		m.skillSelectionStatus = ""
+		m.view = ViewSkillsProject
+	case "source":
+		if err := m.refreshSkillsCatalog(); err != nil {
+			return m, nil
+		}
+		m.selectedSkillSourceSafe = item.SourceSafe
+		m.skillSourceDetailItems = buildSkillSourceDetailItems(m.skillsCatalog, item.SourceSafe)
+		m.skillDetailSelectedIndex = 0
+		m.skillDetailStatus = ""
+		m.view = ViewSkillSourceDetail
+	}
+	return m, nil
+}
+
+func (m Model) installSkillSource() (tea.Model, tea.Cmd) {
+	source := strings.TrimSpace(m.skillsInput)
+	result, err := m.skillsStore.InstallOrUpdateSource(source)
+	if err != nil {
+		m.skillSelectionStatus = err.Error()
+		return m, nil
+	}
+	if err := m.refreshSkillsCatalog(); err != nil {
+		m.skillSelectionStatus = err.Error()
+		return m, nil
+	}
+	m.selectedSkillSourceSafe = result.SourceSafe
+	m.skillSourceDetailItems = buildSkillSourceDetailItems(m.skillsCatalog, result.SourceSafe)
+	m.skillDetailSelectedIndex = 0
+	m.skillDetailStatus = fmt.Sprintf("Installed %d skills from %s", result.InstalledCount, source)
+	m.skillsInput = ""
+	m.skillsCursor = 0
+	m.syncTextInputFromSkillsInput()
+	m.view = ViewSkillSourceDetail
+	return m, nil
+}
+
+func (m Model) saveSkillSelection() (tea.Model, tea.Cmd) {
+	selected := make(map[string]bool)
+	for _, item := range m.skillSelectionItems {
+		if item.Kind == "skill" && item.Selected {
+			selected[item.LinkName] = true
+		}
+	}
+	var err error
+	if m.skillSelectionScope == skillScopeGlobal {
+		err = m.skillsStore.ApplyGlobalSelection(selected)
+	} else {
+		err = m.skillsStore.ApplyProjectSelection(m.cwd, selected)
+	}
+	if err != nil {
+		m.skillSelectionStatus = err.Error()
+		return m, nil
+	}
+	_ = m.refreshSkillsCatalog()
+	if m.skillSelectionScope == skillScopeGlobal {
+		m.skillSelectionStatus = "Saved global skills"
+	} else {
+		m.skillSelectionStatus = "Saved project skills"
+	}
+	m.skillSelectionItems = buildSkillSelectionItems(m.skillsCatalog, m.skillSelectionScope, m.cwd)
+	m.skillsSelectedIndex = firstSelectableSkillIndex(m.skillSelectionItems)
+	return m, nil
+}
+
+func (m Model) selectSkillSourceDetailItem() (tea.Model, tea.Cmd) {
+	idx := render.ClampSelectedIndex(m.skillDetailSelectedIndex, len(m.skillSourceDetailItems))
+	if idx >= len(m.skillSourceDetailItems) {
+		return m, nil
+	}
+	item := m.skillSourceDetailItems[idx]
+	switch item.Kind {
+	case "update":
+		source := item.Source
+		result, err := m.skillsStore.InstallOrUpdateSource(source)
+		if err != nil {
+			m.skillDetailStatus = err.Error()
+			return m, nil
+		}
+		_ = m.refreshSkillsCatalog()
+		m.skillSourceDetailItems = buildSkillSourceDetailItems(m.skillsCatalog, item.SourceSafe)
+		m.skillDetailStatus = fmt.Sprintf("Updated %s (%d skills, %d removed)", source, result.InstalledCount, result.RemovedCount)
+	case "remove":
+		impact, err := m.skillsStore.RemoveSourceImpact(item.SourceSafe, m.cwd)
+		if err != nil {
+			m.skillDetailStatus = err.Error()
+			return m, nil
+		}
+		m.skillRemoveImpact = impact
+		m.skillRemoveStatus = ""
+		m.skillRemoveSelectedIndex = 0
+		m.view = ViewSkillSourceRemoveConfirm
+	}
+	return m, nil
+}
+
+func (m Model) selectSkillSourceRemoveConfirmItem() (tea.Model, tea.Cmd) {
+	if m.skillRemoveSelectedIndex == 0 {
+		result, err := m.skillsStore.RemoveSource(m.selectedSkillSourceSafe)
+		if err != nil {
+			m.skillRemoveStatus = err.Error()
+			return m, nil
+		}
+		_ = m.refreshSkillsCatalog()
+		m.view = ViewSkillsManager
+		m.skillsSelectedIndex = 0
+		m.skillsManagerStatus = fmt.Sprintf("Removed source %s (%d skills)", result.SourceSafe, result.RemovedCount)
+		return m, nil
+	}
+	m.view = ViewSkillSourceDetail
+	return m, nil
+}
+
+func (m Model) currentManagerItems() []managerItem {
+	if len(m.managerItems) == 0 {
+		m.managerItems = []managerItem{{Label: "Skills manager", Kind: "skills"}, {Label: "MCP manager (coming soon)", Kind: "disabled"}}
+	}
+	return m.managerItems
+}
+
+func (m Model) currentSkillsManagerItems() []skillManagerItem {
+	if len(m.skillManagerItems) == 0 {
+		m.skillManagerItems = buildSkillsManagerItems(m.skillsCatalog)
+	}
+	return m.skillManagerItems
+}
+
+func buildSkillsManagerItems(catalog skills.Catalog) []skillManagerItem {
+	items := []skillManagerItem{{Label: "Install source", Kind: "install"}, {Label: "Global skills", Kind: "global"}, {Label: "Project skills", Kind: "project"}}
+	for _, source := range catalog.Sources {
+		items = append(items, skillManagerItem{Label: source.Source, Kind: "source", SourceSafe: source.SourceSafe, Source: source.Source})
+	}
+	return items
+}
+
+func buildSkillSelectionItems(catalog skills.Catalog, scope skillScope, cwd string) []skillSelectionItem {
+	projectPath, _ := filepath.Abs(cwd)
+	var items []skillSelectionItem
+	for _, source := range catalog.Sources {
+		items = append(items, skillSelectionItem{Kind: "header", Label: source.Source, SourceSafe: source.SourceSafe, Source: source.Source})
+		for _, skill := range source.Skills {
+			selected := skill.GlobalEnabled
+			if scope == skillScopeProject {
+				selected = containsProjectPath(skill.ProjectPaths, projectPath)
+			}
+			items = append(items, skillSelectionItem{Kind: "skill", Label: skill.Name, Description: skill.Description, SourceSafe: source.SourceSafe, Source: source.Source, SkillName: skill.Name, LinkName: skills.ActivationLinkName(source.SourceSafe, skill.Name), Selected: selected})
+		}
+	}
+	return items
+}
+
+func buildSkillSourceDetailItems(catalog skills.Catalog, sourceSafe string) []skillSourceDetailItem {
+	source := catalog.SourceBySafe(sourceSafe)
+	if source == nil {
+		return nil
+	}
+	items := []skillSourceDetailItem{{Label: "Update source", Kind: "update", SourceSafe: source.SourceSafe, Source: source.Source}, {Label: "Remove source", Kind: "remove", SourceSafe: source.SourceSafe, Source: source.Source}}
+	for _, skill := range source.Skills {
+		items = append(items, skillSourceDetailItem{Label: skill.Name, Description: skill.Description, Kind: "skill", SourceSafe: source.SourceSafe, Source: source.Source, SkillName: skill.Name})
+	}
+	return items
+}
+
+func firstSelectableSkillIndex(items []skillSelectionItem) int {
+	for i, item := range items {
+		if item.Kind == "skill" {
+			return i
+		}
+	}
+	return 0
+}
+
+func previousSelectableSkillIndex(items []skillSelectionItem, current int) int {
+	if len(items) == 0 {
+		return 0
+	}
+	idx := render.ClampSelectedIndex(current, len(items))
+	for i := idx - 1; i >= 0; i-- {
+		if items[i].Kind == "skill" {
+			return i
+		}
+	}
+	return idx
+}
+
+func nextSelectableSkillIndex(items []skillSelectionItem, current int) int {
+	if len(items) == 0 {
+		return 0
+	}
+	idx := render.ClampSelectedIndex(current, len(items))
+	for i := idx + 1; i < len(items); i++ {
+		if items[i].Kind == "skill" {
+			return i
+		}
+	}
+	return idx
+}
+
+func containsProjectPath(paths []string, target string) bool {
+	for _, path := range paths {
+		if path == target {
+			return true
+		}
+	}
+	return false
 }
 
 // --- Item helpers ---
@@ -1337,6 +1877,287 @@ func (m Model) renderConfigurationSubitems() string {
 		lines = append(lines, fittedLine)
 	}
 
+	return strings.Join(lines, "\n")
+}
+
+func (m Model) renderManagerHub() string {
+	items := m.currentManagerItems()
+	idx := render.ClampSelectedIndex(m.managerSelectedIndex, len(items))
+	lines := []string{"Manager", "", "Use Left from sessions to enter global management.", ""}
+	for i, item := range items {
+		prefix := "  "
+		if i == idx {
+			prefix = "> "
+		}
+		line := render.FitLine(fmt.Sprintf("%s%d. %s", prefix, i, item.Label), m.width)
+		if i == idx {
+			line = render.Colorize(line, render.ANSISelected, m.useColor)
+		}
+		lines = append(lines, line)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (m Model) renderSkillsManager() string {
+	items := m.currentSkillsManagerItems()
+	idx := render.ClampSelectedIndex(m.skillsSelectedIndex, len(items))
+	lines := []string{"Skills manager", render.FitLine("Project: "+m.cwd, m.width)}
+	if m.skillsManagerStatus != "" {
+		lines = append(lines, render.FitLine(m.skillsManagerStatus, m.width))
+	}
+	lines = append(lines, "")
+	for i, item := range items {
+		prefix := "  "
+		if i == idx {
+			prefix = "> "
+		}
+		label := item.Label
+		if item.Kind == "source" {
+			source := m.skillsCatalog.SourceBySafe(item.SourceSafe)
+			if source != nil {
+				label = fmt.Sprintf("%s  (%d skills)", item.Label, len(source.Skills))
+			}
+		}
+		line := render.FitLine(fmt.Sprintf("%s%d. %s", prefix, i, label), m.width)
+		if i == idx {
+			line = render.Colorize(line, render.ANSISelected, m.useColor)
+		}
+		lines = append(lines, line)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (m Model) renderSkillsInstallInput() string {
+	lines := []string{"Install source", "", "Enter GitHub source in owner/repo form.", render.FitLine("Source: "+m.skillsTextInput.View(), m.width)}
+	if m.skillSelectionStatus != "" {
+		lines = append(lines, "", render.FitLine(m.skillSelectionStatus, m.width))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (m Model) renderSkillSelectionView() string {
+	title := "Global skills"
+	if m.view == ViewSkillsProject {
+		title = "Project skills"
+	}
+	idx := render.ClampSelectedIndex(m.skillsSelectedIndex, len(m.skillSelectionItems))
+	skillNameWidth, skillDescriptionWidth := skillListColumnWidths(m.width, render.DisplayWidth("  [ ]"), skillSelectionNames(m.skillSelectionItems))
+	selectedDescription := ""
+	selectedDescriptionLines := []string(nil)
+	if idx < len(m.skillSelectionItems) && m.skillSelectionItems[idx].Kind == "skill" {
+		selectedDescription = strings.TrimSpace(m.skillSelectionItems[idx].Description)
+		selectedDescriptionLines = wrappedSkillDescription(selectedDescription, m.width)
+	}
+	lines := []string{title, render.FitLine("Project: "+m.cwd, m.width)}
+	if m.skillSelectionStatus != "" {
+		lines = append(lines, render.FitLine(m.skillSelectionStatus, m.width))
+	}
+	lines = append(lines, "", "Space toggles, Enter saves.", "")
+	headerLines := len(lines)
+	footerLines := 0
+	if len(selectedDescriptionLines) > 0 {
+		footerLines = 1 + len(selectedDescriptionLines)
+	}
+	maxItemRows := max(1, m.height-headerLines-footerLines)
+	start := skillSelectionWindowStart(len(m.skillSelectionItems), idx, maxItemRows)
+	visibleItems := m.skillSelectionItems[start:min(start+maxItemRows, len(m.skillSelectionItems))]
+	for vi, item := range visibleItems {
+		i := start + vi
+		if item.Kind == "header" {
+			lines = append(lines, render.FitLine(item.Label, m.width))
+			continue
+		}
+		prefix := "  "
+		if i == idx {
+			prefix = "> "
+		}
+		marker := "[ ]"
+		if item.Selected {
+			marker = "[✔]"
+		}
+		line := render.FitLine(renderSkillListLine(prefix+marker, item.Label, item.Description, skillNameWidth, skillDescriptionWidth), m.width)
+		if item.Selected {
+			line = render.Colorize(line, render.ANSISelectedConfig, m.useColor)
+		} else if i == idx {
+			line = render.Colorize(line, render.ANSISelected, m.useColor)
+		}
+		lines = append(lines, line)
+	}
+	if len(selectedDescriptionLines) > 0 {
+		lines = append(lines, "")
+		lines = append(lines, selectedDescriptionLines...)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func skillSelectionWindowStart(itemCount int, selectedIndex int, maxRows int) int {
+	if itemCount <= 0 || maxRows <= 0 || itemCount <= maxRows {
+		return 0
+	}
+	idx := render.ClampSelectedIndex(selectedIndex, itemCount)
+	start := idx - maxRows/2
+	if start < 0 {
+		return 0
+	}
+	maxStart := itemCount - maxRows
+	if start > maxStart {
+		return maxStart
+	}
+	return start
+}
+
+func skillSelectionNames(items []skillSelectionItem) []string {
+	names := make([]string, 0, len(items))
+	for _, item := range items {
+		if item.Kind == "skill" {
+			names = append(names, item.Label)
+		}
+	}
+	return names
+}
+
+func skillSourceDetailNames(items []skillSourceDetailItem) []string {
+	names := make([]string, 0, len(items))
+	for _, item := range items {
+		if item.Kind == "skill" {
+			names = append(names, item.Label)
+		}
+	}
+	return names
+}
+
+func skillListColumnWidths(totalWidth int, prefixWidth int, names []string) (int, int) {
+	contentWidth := max(1, totalWidth-prefixWidth-1)
+	if len(names) == 0 {
+		return contentWidth, 0
+	}
+	const gapWidth = 2
+	maxNameWidth := 0
+	for _, name := range names {
+		nameWidth := render.DisplayWidth(strings.TrimSpace(name))
+		if nameWidth > maxNameWidth {
+			maxNameWidth = nameWidth
+		}
+	}
+	nameWidth := min(maxNameWidth, max(12, contentWidth*3/10))
+	if nameWidth < 1 {
+		nameWidth = 1
+	}
+	if contentWidth-nameWidth < gapWidth+1 {
+		nameWidth = max(1, contentWidth-gapWidth-1)
+	}
+	descriptionWidth := max(0, contentWidth-nameWidth-gapWidth)
+	return nameWidth, descriptionWidth
+}
+
+func renderSkillListLine(prefix string, name string, description string, nameWidth int, descriptionWidth int) string {
+	namePart := render.PadDisplay(render.TruncateToWidth(name, nameWidth), nameWidth, "left")
+	if descriptionWidth <= 0 {
+		return prefix + " " + strings.TrimRight(namePart, " ")
+	}
+	descriptionPart := render.TruncateToWidth(description, descriptionWidth)
+	if descriptionPart == "" {
+		return prefix + " " + strings.TrimRight(namePart, " ")
+	}
+	return prefix + " " + namePart + "  " + descriptionPart
+}
+
+func (m Model) renderSkillSourceDetail() string {
+	idx := render.ClampSelectedIndex(m.skillDetailSelectedIndex, len(m.skillSourceDetailItems))
+	title := "Skill source"
+	if source := m.skillsCatalog.SourceBySafe(m.selectedSkillSourceSafe); source != nil {
+		title = source.Source
+	}
+	numberWidth := 2
+	for i := range m.skillSourceDetailItems {
+		if w := len(fmt.Sprintf("%d.", i)); w > numberWidth {
+			numberWidth = w
+		}
+	}
+	skillNameWidth, skillDescriptionWidth := skillListColumnWidths(m.width, render.DisplayWidth("  ")+numberWidth, skillSourceDetailNames(m.skillSourceDetailItems))
+	selectedDescription := ""
+	selectedDescriptionLines := []string(nil)
+	if idx < len(m.skillSourceDetailItems) && m.skillSourceDetailItems[idx].Kind == "skill" {
+		selectedDescription = strings.TrimSpace(m.skillSourceDetailItems[idx].Description)
+		selectedDescriptionLines = wrappedSkillDescription(selectedDescription, m.width)
+	}
+	lines := []string{render.FitLine(title, m.width)}
+	if m.skillDetailStatus != "" {
+		lines = append(lines, render.FitLine(m.skillDetailStatus, m.width))
+	}
+	lines = append(lines, "")
+	headerLines := len(lines)
+	footerLines := 0
+	if len(selectedDescriptionLines) > 0 {
+		footerLines = 1 + len(selectedDescriptionLines)
+	}
+	maxItemRows := max(1, m.height-headerLines-footerLines)
+	start := skillSelectionWindowStart(len(m.skillSourceDetailItems), idx, maxItemRows)
+	visibleItems := m.skillSourceDetailItems[start:min(start+maxItemRows, len(m.skillSourceDetailItems))]
+	for vi, item := range visibleItems {
+		i := start + vi
+		prefix := "  "
+		if i == idx {
+			prefix = "> "
+		}
+		number := render.PadDisplay(fmt.Sprintf("%d.", i), numberWidth, "right")
+		line := fmt.Sprintf("%s%s %s", prefix, number, item.Label)
+		if item.Kind == "skill" {
+			line = renderSkillListLine(prefix+number, item.Label, item.Description, skillNameWidth, skillDescriptionWidth)
+		}
+		line = render.FitLine(line, m.width)
+		if i == idx {
+			line = render.Colorize(line, render.ANSISelected, m.useColor)
+		}
+		lines = append(lines, line)
+	}
+	if len(selectedDescriptionLines) > 0 {
+		lines = append(lines, "")
+		lines = append(lines, selectedDescriptionLines...)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func wrappedSkillDescription(description string, width int) []string {
+	description = strings.TrimSpace(description)
+	if description == "" {
+		return nil
+	}
+	available := max(1, width-render.DisplayWidth("Description: "))
+	wrapped := render.WrapTextPreserveNewlines(description, available)
+	if len(wrapped) == 0 {
+		return nil
+	}
+	lines := make([]string, 0, len(wrapped))
+	for i, line := range wrapped {
+		prefix := "             "
+		if i == 0 {
+			prefix = "Description: "
+		}
+		lines = append(lines, render.FitLine(prefix+line, width))
+	}
+	return lines
+}
+
+func (m Model) renderSkillSourceRemoveConfirm() string {
+	idx := render.ClampSelectedIndex(m.skillRemoveSelectedIndex, 2)
+	lines := []string{"Remove source", render.FitLine(fmt.Sprintf("Installed skills: %d", m.skillRemoveImpact.InstalledSkills), m.width), render.FitLine(fmt.Sprintf("Global links to remove: %d", m.skillRemoveImpact.GlobalEnabledSkills), m.width), render.FitLine(fmt.Sprintf("Current project links to remove: %d", m.skillRemoveImpact.CurrentProjectSkills), m.width), render.FitLine(fmt.Sprintf("Other project paths to clean: %d", m.skillRemoveImpact.OtherProjectPathCount), m.width)}
+	if m.skillRemoveStatus != "" {
+		lines = append(lines, render.FitLine(m.skillRemoveStatus, m.width))
+	}
+	lines = append(lines, "")
+	options := []string{"Confirm remove", "Cancel"}
+	for i, option := range options {
+		prefix := "  "
+		if i == idx {
+			prefix = "> "
+		}
+		line := render.FitLine(fmt.Sprintf("%s%d. %s", prefix, i, option), m.width)
+		if i == idx {
+			line = render.Colorize(line, render.ANSISelected, m.useColor)
+		}
+		lines = append(lines, line)
+	}
 	return strings.Join(lines, "\n")
 }
 
