@@ -74,8 +74,8 @@ func TestSelectConfigurationActionAppliesItem(t *testing.T) {
 	if model.view != ViewConfigurationItems {
 		t.Fatalf("view = %v, want ViewConfigurationItems", model.view)
 	}
-	if model.configItemSelectedIndex != 1 {
-		t.Fatalf("selected index = %d, want selected item index 1", model.configItemSelectedIndex)
+	if model.config.itemSelectedIndex != 1 {
+		t.Fatalf("selected index = %d, want selected item index 1", model.config.itemSelectedIndex)
 	}
 
 	updated, _ = model.selectConfigurationItem()
@@ -86,10 +86,10 @@ func TestSelectConfigurationActionAppliesItem(t *testing.T) {
 	if model.view != ViewConfigurations {
 		t.Fatalf("view = %v, want ViewConfigurations", model.view)
 	}
-	if model.configStatus != "applied second" {
-		t.Fatalf("status = %q, want applied second", model.configStatus)
+	if model.config.status != "applied second" {
+		t.Fatalf("status = %q, want applied second", model.config.status)
 	}
-	if model.activeAction != nil || model.activeItem != nil || model.activeSubitems != nil {
+	if model.config.activeAction != nil || model.config.activeItem != nil || model.config.activeSubitems != nil {
 		t.Fatalf("configuration workflow state was not cleared")
 	}
 }
@@ -129,11 +129,11 @@ func TestDirectMultiSelectConfigurationActionAppliesSelectedSubitems(t *testing.
 	if model.view != ViewConfigurationSubitems {
 		t.Fatalf("view = %v, want ViewConfigurationSubitems", model.view)
 	}
-	if model.activeSubitems == nil {
+	if model.config.activeSubitems == nil {
 		t.Fatalf("active subitems workflow was not set")
 	}
 
-	model.configItemSelectedIndex = 1
+	model.config.itemSelectedIndex = 1
 	updated, _ = model.handleSpace()
 	model = updated.(Model)
 	updated, _ = model.selectConfigurationSubitems()
@@ -148,10 +148,38 @@ func TestDirectMultiSelectConfigurationActionAppliesSelectedSubitems(t *testing.
 	if model.view != ViewConfigurations {
 		t.Fatalf("view = %v, want ViewConfigurations", model.view)
 	}
-	if model.configStatus != "updated models" {
-		t.Fatalf("status = %q, want updated models", model.configStatus)
+	if model.config.status != "updated models" {
+		t.Fatalf("status = %q, want updated models", model.config.status)
 	}
-	if model.activeAction != nil || model.activeItem != nil || model.activeSubitems != nil {
+	if model.config.activeAction != nil || model.config.activeItem != nil || model.config.activeSubitems != nil {
+		t.Fatalf("configuration workflow state was not cleared")
+	}
+}
+
+func TestConfigurationWorkflowCancelSubitemsReturnsToActionForDirectMultiSelect(t *testing.T) {
+	action := provider.ConfigAction{
+		Name: "Provider openai",
+		DirectMultiSelect: &provider.DirectMultiSelectConfigAction{
+			Item: provider.ConfigItem{Name: "openai", Label: "openai"},
+			Subitems: provider.SubitemConfigAction{
+				LoadItems: func(item provider.ConfigItem, ctx provider.Context) ([]provider.ConfigItem, error) {
+					return []provider.ConfigItem{{Name: "gpt-5", Label: "gpt-5"}}, nil
+				},
+			},
+		},
+	}
+	workflow := newConfigurationWorkflow(fakeProvider{actions: []provider.ConfigAction{action}})
+
+	view := workflow.selectAction("/tmp/work")
+	if view != ViewConfigurationSubitems {
+		t.Fatalf("view = %v, want ViewConfigurationSubitems", view)
+	}
+
+	view = workflow.cancelSubitems()
+	if view != ViewConfigurations {
+		t.Fatalf("view = %v, want ViewConfigurations", view)
+	}
+	if workflow.activeAction != nil || workflow.activeItem != nil || workflow.activeSubitems != nil || workflow.subitems != nil {
 		t.Fatalf("configuration workflow state was not cleared")
 	}
 }
@@ -440,7 +468,7 @@ func TestRenderGlobalSkillsScrollsToBottomSelection(t *testing.T) {
 	}
 }
 
-func TestRenderSkillSelectionViewShowsColumnsAndSelectedDescriptionFooter(t *testing.T) {
+func TestRenderSkillSelectionViewShowsColumnsWithoutDescriptionFooter(t *testing.T) {
 	model := NewModel(fakeProvider{}, nil, "/tmp/work", "default", 80, 12, false)
 	model.view = ViewSkillsGlobal
 	model.skillSelectionItems = []skillSelectionItem{
@@ -456,15 +484,12 @@ func TestRenderSkillSelectionViewShowsColumnsAndSelectedDescriptionFooter(t *tes
 	if !strings.Contains(view, "Handle incoming issues") {
 		t.Fatalf("expected inline description in view, got %q", view)
 	}
-	if !strings.Contains(view, "Description: Handle incoming issues") {
-		t.Fatalf("expected selected skill description footer in view, got %q", view)
-	}
-	if !strings.Contains(view, "project for long-runn") || !strings.Contains(view, "ing triage workflows") {
-		t.Fatalf("expected wrapped full description in footer, got %q", view)
+	if strings.Contains(view, "Description:") {
+		t.Fatalf("did not expect selected skill description footer in view, got %q", view)
 	}
 }
 
-func TestRenderSkillSourceDetailShowsColumnsAndSelectedDescriptionFooter(t *testing.T) {
+func TestRenderSkillSourceDetailShowsColumnsWithoutDescriptionFooter(t *testing.T) {
 	model := NewModel(fakeProvider{}, nil, "/tmp/work", "default", 80, 12, false)
 	model.view = ViewSkillSourceDetail
 	model.skillSourceDetailItems = []skillSourceDetailItem{
@@ -481,8 +506,8 @@ func TestRenderSkillSourceDetailShowsColumnsAndSelectedDescriptionFooter(t *test
 	if !strings.Contains(view, "triage") || !strings.Contains(view, "Handle incoming issues") {
 		t.Fatalf("expected skill row with inline description in view, got %q", view)
 	}
-	if !strings.Contains(view, "Description: Handle incoming issues") {
-		t.Fatalf("expected selected skill description footer in view, got %q", view)
+	if strings.Contains(view, "Description:") {
+		t.Fatalf("did not expect selected skill description footer in view, got %q", view)
 	}
 }
 

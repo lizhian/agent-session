@@ -20,12 +20,9 @@ import (
 // View represents the current screen in the picker state machine.
 type View int
 
-type terminalPreviewReadyMsg struct{}
-
 const (
 	ViewSessions View = iota
 	ViewPreview
-	ViewTerminalPreview
 	ViewWorkspaces
 	ViewConfigurations
 	ViewConfigurationItems
@@ -88,8 +85,6 @@ type Model struct {
 	// Navigation state.
 	sessionSelectedIndex     int
 	workspaceSelectedIndex   int
-	configSelectedIndex      int
-	configItemSelectedIndex  int
 	managerSelectedIndex     int
 	skillsSelectedIndex      int
 	skillDetailSelectedIndex int
@@ -110,13 +105,7 @@ type Model struct {
 	cwdFile string
 
 	// Configuration state.
-	configActions  []provider.ConfigAction
-	configItems    []provider.ConfigItem
-	configSubitems []provider.ConfigItem
-	activeAction   *provider.ConfigAction
-	activeItem     *provider.ConfigItem
-	activeSubitems *provider.SubitemConfigAction
-	configStatus   string
+	config configurationWorkflow
 
 	// Skills manager state.
 	skillsStore             *skills.Store
@@ -164,7 +153,7 @@ func NewModel(p provider.Provider, sessions []provider.Session, cwd, permissionM
 		width:                width,
 		height:               height,
 		useColor:             useColor,
-		configActions:        p.ConfigurationActions(),
+		config:               newConfigurationWorkflow(p),
 		skillsStore:          skills.NewStore(""),
 	}
 	model.initSkillsTextInput()
@@ -199,17 +188,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.MouseMsg:
 		return m.handleMouse(msg)
 
-	case terminalPreviewReadyMsg:
-		if m.view == ViewTerminalPreview {
-			printTerminalText(clearTerminalAndScrollback)
-			items := m.currentSessionItems()
-			idx := render.ClampSelectedIndex(m.sessionSelectedIndex, len(items))
-			if idx < len(items) && items[idx].Type == "session" && items[idx].Session != nil {
-				printTerminalText(m.terminalPreviewText(*items[idx].Session))
-			}
-		}
-		return m, nil
-
 	case tea.KeyMsg:
 		switch msg.Type {
 		case tea.KeyCtrlC:
@@ -220,19 +198,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		switch msg.String() {
 		case "esc":
-			if m.view == ViewTerminalPreview {
-				return m.closeTerminalPreview()
-			}
 			return m.handleEscape()
 		case "enter", "return":
-			if m.view == ViewTerminalPreview {
-				return m.closeTerminalPreview()
-			}
 			return m.handleEnter()
 		case " ":
-			if m.view == ViewTerminalPreview {
-				return m.closeTerminalPreview()
-			}
 			return m.handleSpace()
 		case "tab":
 			return m.handleTab()
@@ -249,12 +218,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "delete":
 			return m.handleBackspace()
 		default:
-			if m.view == ViewTerminalPreview {
-				if len(msg.Runes) == 1 && (msg.Runes[0] == 'q' || msg.Runes[0] == 'Q') {
-					return m.closeTerminalPreview()
-				}
-				return m, nil
-			}
 			// Forward any printable text, including pasted strings and IME commits.
 			if len(msg.Runes) > 0 {
 				return m.handleText(string(msg.Runes))
@@ -275,8 +238,6 @@ func (m Model) View() string {
 		return m.renderSessions()
 	case ViewPreview:
 		return m.renderPreview()
-	case ViewTerminalPreview:
-		return ""
 	case ViewWorkspaces:
 		return m.renderWorkspaces()
 	case ViewConfigurations:
@@ -367,16 +328,6 @@ func (m Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m Model) closeTerminalPreview() (tea.Model, tea.Cmd) {
-	printTerminalText(clearTerminalAndScrollback)
-	m.view = ViewSessions
-	m.previewTranscript = nil
-	m.previewError = ""
-	m.previewScroll = 0
-	m.previewAutoBottom = false
-	return m, tea.Sequence(tea.EnterAltScreen, tea.EnableMouseCellMotion)
-}
-
 func (m Model) handleEscape() (tea.Model, tea.Cmd) {
 	switch m.view {
 	case ViewPreview:
@@ -390,11 +341,7 @@ func (m Model) handleEscape() (tea.Model, tea.Cmd) {
 		return m.cancelConfigurationSubitems()
 	case ViewConfigurationItems:
 		m.view = ViewConfigurations
-		m.activeAction = nil
-		m.activeItem = nil
-		m.activeSubitems = nil
-		m.configItems = nil
-		m.configSubitems = nil
+		m.config.cancelItems()
 		return m, nil
 	case ViewConfigurations:
 		m.view = ViewWorkspaces
@@ -477,9 +424,9 @@ func (m Model) handleSpace() (tea.Model, tea.Cmd) {
 			m.previewTranscript = m.provider.LoadSessionTranscript(s, provider.Context{Cwd: m.cwd})
 			m.previewError = ""
 			m.previewScroll = 0
-			m.previewAutoBottom = false
-			m.view = ViewTerminalPreview
-			return m, tea.Sequence(tea.ExitAltScreen, tea.DisableMouse, printTerminalPreview())
+			m.previewAutoBottom = true
+			m.view = ViewPreview
+			return m, nil
 		}
 		return m, nil
 	case ViewPreview:
@@ -490,13 +437,7 @@ func (m Model) handleSpace() (tea.Model, tea.Cmd) {
 		m.previewAutoBottom = false
 		return m, nil
 	case ViewConfigurationSubitems:
-		idx := render.ClampSelectedIndex(m.configItemSelectedIndex, len(m.configSubitems))
-		if idx < len(m.configSubitems) {
-			m.configSubitems[idx].Selected = !m.configSubitems[idx].Selected
-			if idx+1 < len(m.configSubitems) {
-				m.configItemSelectedIndex = idx + 1
-			}
-		}
+		m.config.toggleSubitem()
 		return m, nil
 	case ViewSkillsGlobal, ViewSkillsProject:
 		idx := render.ClampSelectedIndex(m.skillsSelectedIndex, len(m.skillSelectionItems))
@@ -543,9 +484,7 @@ func (m Model) handleUp() (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case ViewConfigurations:
-		if m.configSelectedIndex > 0 {
-			m.configSelectedIndex--
-		}
+		m.config.moveAction(-1)
 		return m, nil
 	case ViewManagerHub:
 		if m.managerSelectedIndex > 0 {
@@ -563,8 +502,10 @@ func (m Model) handleUp() (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case ViewConfigurationItems, ViewConfigurationSubitems:
-		if m.configItemSelectedIndex > 0 {
-			m.configItemSelectedIndex--
+		if m.view == ViewConfigurationItems {
+			m.config.moveItem(-1)
+		} else {
+			m.config.moveSubitem(-1)
 		}
 		return m, nil
 	case ViewSkillSourceDetail:
@@ -596,7 +537,7 @@ func (m Model) handleDown() (tea.Model, tea.Cmd) {
 		m.workspaceSelectedIndex = render.ClampSelectedIndex(m.workspaceSelectedIndex+1, len(items))
 		return m, nil
 	case ViewConfigurations:
-		m.configSelectedIndex = render.ClampSelectedIndex(m.configSelectedIndex+1, len(m.configActions))
+		m.config.moveAction(1)
 		return m, nil
 	case ViewManagerHub:
 		m.managerSelectedIndex = render.ClampSelectedIndex(m.managerSelectedIndex+1, len(m.currentManagerItems()))
@@ -605,10 +546,10 @@ func (m Model) handleDown() (tea.Model, tea.Cmd) {
 		m.skillsSelectedIndex = render.ClampSelectedIndex(m.skillsSelectedIndex+1, len(m.currentSkillsManagerItems()))
 		return m, nil
 	case ViewConfigurationItems:
-		m.configItemSelectedIndex = render.ClampSelectedIndex(m.configItemSelectedIndex+1, len(m.configItems))
+		m.config.moveItem(1)
 		return m, nil
 	case ViewConfigurationSubitems:
-		m.configItemSelectedIndex = render.ClampSelectedIndex(m.configItemSelectedIndex+1, len(m.configSubitems))
+		m.config.moveSubitem(1)
 		return m, nil
 	case ViewSkillsGlobal, ViewSkillsProject:
 		m.skillsSelectedIndex = nextSelectableSkillIndex(m.skillSelectionItems, m.skillsSelectedIndex)
@@ -638,11 +579,7 @@ func (m Model) handleLeft() (tea.Model, tea.Cmd) {
 		return m, nil
 	case ViewConfigurationItems:
 		m.view = ViewConfigurations
-		m.activeAction = nil
-		m.activeItem = nil
-		m.activeSubitems = nil
-		m.configItems = nil
-		m.configSubitems = nil
+		m.config.cancelItems()
 		return m, nil
 	case ViewConfigurationSubitems:
 		return m.cancelConfigurationSubitems()
@@ -670,15 +607,7 @@ func (m Model) handleLeft() (tea.Model, tea.Cmd) {
 }
 
 func (m Model) cancelConfigurationSubitems() (tea.Model, tea.Cmd) {
-	m.activeItem = nil
-	m.activeSubitems = nil
-	m.configSubitems = nil
-	if m.activeAction != nil && m.activeAction.DirectMultiSelect != nil {
-		m.view = ViewConfigurations
-		m.activeAction = nil
-		return m, nil
-	}
-	m.view = ViewConfigurationItems
+	m.view = m.config.cancelSubitems()
 	return m, nil
 }
 
@@ -694,8 +623,7 @@ func (m Model) handleRight() (tea.Model, tea.Cmd) {
 		return m, nil
 	case ViewWorkspaces:
 		m.view = ViewConfigurations
-		m.configSelectedIndex = 0
-		m.configStatus = ""
+		m.config.openConfigurations()
 		return m, nil
 	case ViewManagerHub:
 		m.view = ViewSkillsManager
@@ -827,145 +755,17 @@ func (m Model) selectWorkspace() (tea.Model, tea.Cmd) {
 }
 
 func (m Model) selectConfiguration() (tea.Model, tea.Cmd) {
-	idx := render.ClampSelectedIndex(m.configSelectedIndex, len(m.configActions))
-	if idx >= len(m.configActions) {
-		return m, nil
-	}
-	action := m.configActions[idx]
-	m.activeAction = &action
-	m.configItemSelectedIndex = 0
-
-	// Direct multiselect actions skip the intermediate item list.
-	if action.DirectMultiSelect != nil {
-		item := action.DirectMultiSelect.Item
-		m.activeItem = &item
-		m.activeSubitems = &action.DirectMultiSelect.Subitems
-		ctx := provider.Context{Cwd: m.cwd, DataHome: m.provider.DefaultHome()}
-		subitems, err := action.DirectMultiSelect.Subitems.LoadItems(item, ctx)
-		if err != nil {
-			m.configSubitems = nil
-			m.configStatus = err.Error()
-			return m, nil
-		}
-		if len(subitems) == 0 {
-			m.configSubitems = nil
-			m.configStatus = action.DirectMultiSelect.Subitems.EmptyMessage
-			if m.configStatus == "" {
-				m.configStatus = "No models."
-			}
-			return m, nil
-		}
-		m.configSubitems = subitems
-		m.configStatus = ""
-		m.view = ViewConfigurationSubitems
-		return m, nil
-	}
-
-	if action.Select != nil && action.Select.LoadItems != nil {
-		ctx := provider.Context{Cwd: m.cwd, DataHome: m.provider.DefaultHome()}
-		items, err := action.Select.LoadItems(ctx)
-		if err != nil {
-			m.configItems = nil
-			m.configStatus = err.Error()
-		} else {
-			m.configItems = items
-			m.configItemSelectedIndex = selectedConfigItemIndex(items)
-			m.configStatus = ""
-		}
-	}
-	m.view = ViewConfigurationItems
+	m.view = m.config.selectAction(m.cwd)
 	return m, nil
 }
 
-func selectedConfigItemIndex(items []provider.ConfigItem) int {
-	for i, item := range items {
-		if item.Selected {
-			return i
-		}
-	}
-	return 0
-}
-
 func (m Model) selectConfigurationItem() (tea.Model, tea.Cmd) {
-	if m.activeAction == nil || m.activeAction.Select == nil {
-		return m, nil
-	}
-	idx := render.ClampSelectedIndex(m.configItemSelectedIndex, len(m.configItems))
-	if idx >= len(m.configItems) {
-		return m, nil
-	}
-	item := m.configItems[idx]
-
-	// Handle multiselect subitems.
-	if m.activeAction.Select.MultiSelect != nil {
-		m.activeItem = &item
-		m.activeSubitems = m.activeAction.Select.MultiSelect
-		m.configItemSelectedIndex = 0
-		ctx := provider.Context{Cwd: m.cwd, DataHome: m.provider.DefaultHome()}
-		subitems, err := m.activeAction.Select.MultiSelect.LoadItems(item, ctx)
-		if err != nil {
-			m.configSubitems = nil
-			m.configStatus = err.Error()
-			return m, nil
-		}
-		if len(subitems) == 0 {
-			m.configSubitems = nil
-			m.configStatus = m.activeAction.Select.MultiSelect.EmptyMessage
-			if m.configStatus == "" {
-				m.configStatus = "No models."
-			}
-			return m, nil
-		}
-		m.configSubitems = subitems
-		m.configStatus = ""
-		m.view = ViewConfigurationSubitems
-		return m, nil
-	}
-
-	// Apply item.
-	if m.activeAction.Select.ApplyItem != nil {
-		ctx := provider.Context{Cwd: m.cwd, DataHome: m.provider.DefaultHome()}
-		status, err := m.activeAction.Select.ApplyItem(item, ctx)
-		if err != nil {
-			m.configStatus = err.Error()
-		} else {
-			m.configStatus = status
-		}
-		m.view = ViewConfigurations
-		m.activeAction = nil
-		m.activeItem = nil
-		m.activeSubitems = nil
-		m.configItems = nil
-		m.configSubitems = nil
-	}
+	m.view = m.config.selectItem(m.cwd)
 	return m, nil
 }
 
 func (m Model) selectConfigurationSubitems() (tea.Model, tea.Cmd) {
-	if m.activeAction == nil || m.activeItem == nil || m.activeSubitems == nil || m.activeSubitems.Apply == nil {
-		return m, nil
-	}
-	var selected []provider.ConfigItem
-	for _, item := range m.configSubitems {
-		if item.Selected {
-			selected = append(selected, item)
-		}
-	}
-	ctx := provider.Context{Cwd: m.cwd, DataHome: m.provider.DefaultHome()}
-	status, err := m.activeSubitems.Apply(*m.activeItem, selected, ctx)
-	if err != nil {
-		m.configStatus = err.Error()
-	} else {
-		m.configStatus = status
-		m.configActions = m.provider.ConfigurationActions()
-	}
-	m.view = ViewConfigurations
-	m.activeAction = nil
-	m.activeItem = nil
-	m.activeSubitems = nil
-	m.configItems = nil
-	m.configSubitems = nil
-	m.configSelectedIndex = render.ClampSelectedIndex(m.configSelectedIndex, len(m.configActions))
+	m.view = m.config.applySubitems(m.cwd)
 	return m, nil
 }
 
@@ -1311,29 +1111,24 @@ func (m Model) renderSessions() string {
 		title += "  " + items[idx].Session.ID
 	}
 
-	lines := []string{
+	header := []string{
 		render.FitLine(title, m.width),
 		render.FitLine("Workspace: "+m.cwd, m.width),
 		render.FitLine(render.PickerStatusLine(m.permissionMode, filteredCount, m.sessionQuery, m.useColor), m.width),
 		"",
 	}
-
-	maxItemRows := max(1, m.height-7)
-	start := max(0, min(idx-maxItemRows+1, len(items)-maxItemRows))
-	visibleItems := items[start:min(start+maxItemRows, len(items))]
-
-	for vi, item := range visibleItems {
-		itemIndex := start + vi
+	rows := make([]listRow, 0, len(items))
+	for itemIndex, item := range items {
 		prefix := "  "
 		if itemIndex == idx {
 			prefix = "> "
 		}
 
 		if item.Type == "new" {
-			lines = append(lines, render.FitLine(
-				fmt.Sprintf("%s%s new", prefix, render.PadDisplay("0.", numberWidth, "right")),
-				m.width,
-			))
+			rows = append(rows, listRow{
+				Text:     fmt.Sprintf("%s%s new", prefix, render.PadDisplay("0.", numberWidth, "right")),
+				Selected: itemIndex == idx,
+			})
 			continue
 		}
 
@@ -1360,75 +1155,26 @@ func (m Model) renderSessions() string {
 			render.PadDisplay(messages, msgsWidth, "right"),
 			promptPart,
 		)
-		fittedLine := render.FitLine(line, m.width)
-		if itemIndex == idx {
-			fittedLine = render.Colorize(fittedLine, render.ANSISelected, m.useColor)
-		}
-		lines = append(lines, fittedLine)
+		rows = append(rows, listRow{
+			Text:     line,
+			Selected: itemIndex == idx,
+		})
 	}
 
+	footer := []string(nil)
 	if filteredCount == 0 && strings.TrimSpace(m.sessionQuery) != "" {
-		lines = append(lines, "", "No matching sessions.")
+		footer = append(footer, "", "No matching sessions.")
 	}
 
-	return strings.Join(lines, "\n")
-}
-
-const clearTerminalAndScrollback = "\x1b[H\x1b[2J\x1b[3J"
-
-func printTerminalPreview() tea.Cmd {
-	return func() tea.Msg {
-		return terminalPreviewReadyMsg{}
-	}
-}
-
-func printTerminalText(text string) {
-	fmt.Print(strings.ReplaceAll(text, "\n", "\r\n"))
-}
-
-func (m Model) terminalPreviewText(s provider.Session) string {
-	width := m.width
-	if width <= 0 {
-		width = 80
-	}
-	now := time.Now()
-	lines := []string{
-		render.Colorize(render.FitLine(m.provider.Name()+" session preview", width), render.ANSIPreviewHeader, m.useColor),
-		render.Colorize(render.FitLine("Workspace: "+m.cwd, width), render.ANSIPreviewHeader, m.useColor),
-		render.Colorize(render.FitLine("Session: "+s.ID, width), render.ANSIPreviewHeader, m.useColor),
-		render.Colorize(render.FitLine(fmt.Sprintf("Messages: %d", s.MessageCount), width), render.ANSIPreviewHeader, m.useColor),
-		render.Colorize(render.FitLine("Started: "+s.StartedAt, width), render.ANSIPreviewHeader, m.useColor),
-		render.Colorize(render.FitLine("Updated: "+s.UpdatedAt, width), render.ANSIPreviewHeader, m.useColor),
-		render.Colorize(render.FitLine(fmt.Sprintf("Transcript: %d conversation messages", previewMessageCount(m.previewTranscript)), width), render.ANSIPreviewHeader, m.useColor),
-	}
-	for i, msg := range m.previewTranscript {
-		lines = append(lines, "")
-		if msg.Role == "omitted" {
-			for _, omittedLine := range []string{".", ".", ".", msg.Text, ".", ".", "."} {
-				lines = append(lines, render.Colorize(render.FitLine(omittedLine, width), render.ANSIPreviewOmitted, m.useColor))
-			}
-			continue
-		}
-		ordinal := msg.Ordinal
-		if ordinal <= 0 {
-			ordinal = i + 1
-		}
-		role := strings.ToLower(msg.Role)
-		header := render.Colorize(
-			fmt.Sprintf("#%d %s %s", ordinal, role, render.FormatSessionTime(msg.Timestamp, now)),
-			render.ANSIPreviewMeta,
-			m.useColor,
-		)
-		lines = append(lines, render.FitLine(header, width))
-		for _, line := range render.WrapTextPreserveNewlines(truncatePreviewMessageText(msg.Text), width) {
-			fitted := render.FitLine(line, width)
-			if role == "assistant" {
-				fitted = render.Colorize(fitted, render.ANSIPreviewMuted, m.useColor)
-			}
-			lines = append(lines, fitted)
-		}
-	}
-	return strings.Join(lines, "\n") + "\n"
+	return listView{
+		Width:                m.width,
+		Height:               m.height - 3,
+		Header:               header,
+		Rows:                 rows,
+		Footer:               footer,
+		UseColor:             m.useColor,
+		DefaultSelectedColor: render.ANSISelected,
+	}.Render()
 }
 
 func (m Model) renderPreview() string {
@@ -1499,8 +1245,9 @@ func (m Model) renderPreview() string {
 	if m.previewAutoBottom {
 		scroll = min(lastMessageStart, maxScroll)
 	}
-	visibleBody := bodyLines[scroll:min(scroll+bodyHeight, len(bodyLines))]
-	return strings.Join(append(headerLines, visibleBody...), "\n")
+	header := renderViewport(m.width, len(headerLines), strings.Join(headerLines, "\n"), 0)
+	body := renderViewport(m.width, max(1, bodyHeight-1), strings.Join(bodyLines, "\n"), scroll)
+	return header + "\n" + body + "\n" + renderHelp(m.width, helpKeyMapForView(helpKindPreview))
 }
 
 func previewMessageCount(messages []provider.TranscriptMessage) int {
@@ -1581,19 +1328,14 @@ func (m Model) renderWorkspaces() string {
 	fixedWidth := 2 + numberWidth + 2 + timeWidth + 2 + sessionsWidth + 2 + msgsWidth + 2
 	pathWidth := max(1, m.width-fixedWidth)
 
-	lines := []string{
+	header := []string{
 		render.FitLine(title, m.width),
 		render.FitLine("Search: "+m.workspaceQuery, m.width),
 		render.FitLine(fmt.Sprintf("Matches: %d", len(items)), m.width),
 		"",
 	}
-
-	maxItemRows := max(1, m.height-5)
-	start := max(0, min(idx-maxItemRows+1, len(items)-maxItemRows))
-	visibleItems := items[start:min(start+maxItemRows, len(items))]
-
-	for vi, item := range visibleItems {
-		itemIndex := start + vi
+	rows := make([]listRow, 0, len(items))
+	for itemIndex, item := range items {
 		prefix := "  "
 		if itemIndex == idx {
 			prefix = "> "
@@ -1619,35 +1361,45 @@ func (m Model) renderWorkspaces() string {
 			render.PadDisplay(messages, msgsWidth, "right"),
 			wsPath,
 		)
-		fittedLine := render.FitLine(line, m.width)
-		if itemIndex == idx {
-			fittedLine = render.Colorize(fittedLine, render.ANSISelected, m.useColor)
-		}
-		lines = append(lines, fittedLine)
+		rows = append(rows, listRow{
+			Text:     line,
+			Selected: itemIndex == idx,
+		})
 	}
 
-	return strings.Join(lines, "\n")
+	return listView{
+		Width:                m.width,
+		Height:               m.height - 1,
+		Header:               header,
+		Rows:                 rows,
+		UseColor:             m.useColor,
+		DefaultSelectedColor: render.ANSISelected,
+	}.Render()
 }
 
 func (m Model) renderConfigurations() string {
 	title := m.provider.ConfigurationTitle()
-	items := m.configActions
+	items := m.config.actions
 
-	lines := []string{
+	header := []string{
 		render.FitLine(title, m.width),
 	}
 
-	if m.configStatus != "" {
-		lines = append(lines, render.FitLine(m.configStatus, m.width))
+	if m.config.status != "" {
+		header = append(header, render.FitLine(m.config.status, m.width))
 	}
-	lines = append(lines, "")
+	header = append(header, "")
 
 	if len(items) == 0 {
-		lines = append(lines, "No configurations.")
-		return strings.Join(lines, "\n")
+		return listView{
+			Width:        m.width,
+			Height:       m.height,
+			Header:       header,
+			EmptyMessage: "No configurations.",
+		}.Render()
 	}
 
-	idx := render.ClampSelectedIndex(m.configSelectedIndex, len(items))
+	idx := render.ClampSelectedIndex(m.config.selectedIndex, len(items))
 	numberWidth := 2
 	nameWidth := 0
 
@@ -1698,12 +1450,8 @@ func (m Model) renderConfigurations() string {
 		}
 	}
 
-	maxItemRows := max(1, m.height-6)
-	start := max(0, min(idx-maxItemRows+1, len(items)-maxItemRows))
-	visibleItems := rows[start:min(start+maxItemRows, len(rows))]
-
-	for vi, row := range visibleItems {
-		itemIndex := start + vi
+	listRows := make([]listRow, 0, len(rows))
+	for itemIndex, row := range rows {
 		prefix := "  "
 		if itemIndex == idx {
 			prefix = "> "
@@ -1724,54 +1472,64 @@ func (m Model) renderConfigurations() string {
 			line += "  " + strings.Join(aligned, "  ")
 		}
 
-		fittedLine := render.FitLine(line, m.width)
-		if itemIndex == idx {
-			fittedLine = render.Colorize(fittedLine, render.ANSISelected, m.useColor)
-		}
-		lines = append(lines, fittedLine)
+		listRows = append(listRows, listRow{
+			Text:     line,
+			Selected: itemIndex == idx,
+		})
 	}
 
-	return strings.Join(lines, "\n")
+	return listView{
+		Width:                m.width,
+		Height:               m.height,
+		Header:               header,
+		Rows:                 listRows,
+		UseColor:             m.useColor,
+		DefaultSelectedColor: render.ANSISelected,
+	}.Render()
 }
 
 func (m Model) renderConfigurationItems() string {
 	title := "Configurations"
-	if m.activeAction != nil && m.activeAction.Title != "" {
-		title = m.activeAction.Title
+	if m.config.activeAction != nil && m.config.activeAction.Title != "" {
+		title = m.config.activeAction.Title
 	}
 
-	lines := []string{
+	header := []string{
 		render.FitLine(title, m.width),
 	}
 
-	if m.configStatus != "" {
-		lines = append(lines, render.FitLine(m.configStatus, m.width))
+	if m.config.status != "" {
+		header = append(header, render.FitLine(m.config.status, m.width))
 	}
-	lines = append(lines, "")
+	header = append(header, "")
 
-	if len(m.configItems) == 0 {
+	if len(m.config.items) == 0 {
 		emptyMsg := "No configurations."
-		if m.activeAction != nil && m.activeAction.Select != nil && m.activeAction.Select.EmptyMessage != "" {
-			emptyMsg = m.activeAction.Select.EmptyMessage
+		if m.config.activeAction != nil && m.config.activeAction.Select != nil && m.config.activeAction.Select.EmptyMessage != "" {
+			emptyMsg = m.config.activeAction.Select.EmptyMessage
 		}
-		lines = append(lines, emptyMsg)
-		return strings.Join(lines, "\n")
+		return listView{
+			Width:        m.width,
+			Height:       m.height,
+			Header:       header,
+			EmptyMessage: emptyMsg,
+		}.Render()
 	}
 
-	idx := render.ClampSelectedIndex(m.configItemSelectedIndex, len(m.configItems))
+	idx := render.ClampSelectedIndex(m.config.itemSelectedIndex, len(m.config.items))
 	numberWidth := 2
 	labelWidth := 0
 
 	// Calculate column widths from visible items.
 	columnCount := 0
-	for _, item := range m.configItems {
+	for _, item := range m.config.items {
 		if len(item.Columns) > columnCount {
 			columnCount = len(item.Columns)
 		}
 	}
 	columnWidths := make([]int, columnCount)
 
-	for i, item := range m.configItems {
+	for i, item := range m.config.items {
 		num := fmt.Sprintf("%d.", i)
 		if len(num) > numberWidth {
 			numberWidth = len(num)
@@ -1788,8 +1546,8 @@ func (m Model) renderConfigurationItems() string {
 		}
 	}
 
-	for vi, item := range m.configItems {
-		itemIndex := vi
+	rows := make([]listRow, 0, len(m.config.items))
+	for itemIndex, item := range m.config.items {
 		prefix := "  "
 		if itemIndex == idx {
 			prefix = "> "
@@ -1811,52 +1569,62 @@ func (m Model) renderConfigurationItems() string {
 		if suffix != "" {
 			line += "  " + suffix
 		}
-		fittedLine := render.FitLine(line, m.width)
-		if itemIndex == idx {
-			fittedLine = render.Colorize(fittedLine, render.ANSISelected, m.useColor)
-		}
-		lines = append(lines, fittedLine)
+		rows = append(rows, listRow{
+			Text:     line,
+			Selected: itemIndex == idx,
+		})
 	}
 
-	return strings.Join(lines, "\n")
+	return listView{
+		Width:                m.width,
+		Height:               m.height,
+		Header:               header,
+		Rows:                 rows,
+		UseColor:             m.useColor,
+		DefaultSelectedColor: render.ANSISelected,
+	}.Render()
 }
 
 func (m Model) renderConfigurationSubitems() string {
 	title := "Configurations"
-	if m.activeSubitems != nil && m.activeSubitems.Title != nil && m.activeItem != nil {
-		title = m.activeSubitems.Title(*m.activeItem)
+	if m.config.activeSubitems != nil && m.config.activeSubitems.Title != nil && m.config.activeItem != nil {
+		title = m.config.activeSubitems.Title(*m.config.activeItem)
 	}
 
-	lines := []string{
+	header := []string{
 		render.FitLine(title, m.width),
 	}
 
-	if m.configStatus != "" {
-		lines = append(lines, render.FitLine(m.configStatus, m.width))
+	if m.config.status != "" {
+		header = append(header, render.FitLine(m.config.status, m.width))
 	}
-	lines = append(lines, "")
+	header = append(header, "")
 
-	if len(m.configSubitems) == 0 {
+	if len(m.config.subitems) == 0 {
 		emptyMsg := "No configurations."
-		if m.activeSubitems != nil && m.activeSubitems.EmptyMessage != "" {
-			emptyMsg = m.activeSubitems.EmptyMessage
+		if m.config.activeSubitems != nil && m.config.activeSubitems.EmptyMessage != "" {
+			emptyMsg = m.config.activeSubitems.EmptyMessage
 		}
-		lines = append(lines, emptyMsg)
-		return strings.Join(lines, "\n")
+		return listView{
+			Width:        m.width,
+			Height:       m.height,
+			Header:       header,
+			EmptyMessage: emptyMsg,
+		}.Render()
 	}
 
-	idx := render.ClampSelectedIndex(m.configItemSelectedIndex, len(m.configSubitems))
+	idx := render.ClampSelectedIndex(m.config.itemSelectedIndex, len(m.config.subitems))
 	numberWidth := 2
 
-	for i := range m.configSubitems {
+	for i := range m.config.subitems {
 		num := fmt.Sprintf("%d.", i)
 		if len(num) > numberWidth {
 			numberWidth = len(num)
 		}
 	}
 
-	for vi, item := range m.configSubitems {
-		itemIndex := vi
+	rows := make([]listRow, 0, len(m.config.subitems))
+	for itemIndex, item := range m.config.subitems {
 		prefix := "  "
 		if itemIndex == idx {
 			prefix = "> "
@@ -1868,44 +1636,62 @@ func (m Model) renderConfigurationSubitems() string {
 		}
 
 		line := fmt.Sprintf("%s%s %s%s", prefix, render.PadDisplay(fmt.Sprintf("%d.", itemIndex), numberWidth, "right"), marker, item.Label)
-		fittedLine := render.FitLine(line, m.width)
-		if item.Selected {
-			fittedLine = render.Colorize(fittedLine, render.ANSISelectedConfig, m.useColor)
-		} else if itemIndex == idx {
-			fittedLine = render.Colorize(fittedLine, render.ANSISelected, m.useColor)
+		row := listRow{
+			Text:     line,
+			Selected: item.Selected || itemIndex == idx,
 		}
-		lines = append(lines, fittedLine)
+		if item.Selected {
+			row.Color = render.ANSISelectedConfig
+		} else if itemIndex == idx {
+			row.Color = render.ANSISelected
+		}
+		rows = append(rows, row)
 	}
 
-	return strings.Join(lines, "\n")
+	return listView{
+		Width:                m.width,
+		Height:               m.height,
+		Header:               header,
+		Rows:                 rows,
+		UseColor:             m.useColor,
+		DefaultSelectedColor: render.ANSISelected,
+	}.Render()
 }
 
 func (m Model) renderManagerHub() string {
 	items := m.currentManagerItems()
 	idx := render.ClampSelectedIndex(m.managerSelectedIndex, len(items))
-	lines := []string{"Manager", "", "Use Left from sessions to enter global management.", ""}
+	header := []string{"Manager", "", "Use Left from sessions to enter global management.", ""}
+	rows := make([]listRow, 0, len(items))
 	for i, item := range items {
 		prefix := "  "
 		if i == idx {
 			prefix = "> "
 		}
-		line := render.FitLine(fmt.Sprintf("%s%d. %s", prefix, i, item.Label), m.width)
-		if i == idx {
-			line = render.Colorize(line, render.ANSISelected, m.useColor)
-		}
-		lines = append(lines, line)
+		rows = append(rows, listRow{
+			Text:     fmt.Sprintf("%s%d. %s", prefix, i, item.Label),
+			Selected: i == idx,
+		})
 	}
-	return strings.Join(lines, "\n")
+	return menuListView{
+		Width:    m.width,
+		Height:   m.height,
+		Header:   header,
+		Rows:     rows,
+		Selected: idx,
+		UseColor: m.useColor,
+	}.Render()
 }
 
 func (m Model) renderSkillsManager() string {
 	items := m.currentSkillsManagerItems()
 	idx := render.ClampSelectedIndex(m.skillsSelectedIndex, len(items))
-	lines := []string{"Skills manager", render.FitLine("Project: "+m.cwd, m.width)}
+	header := []string{"Skills manager", render.FitLine("Project: "+m.cwd, m.width)}
 	if m.skillsManagerStatus != "" {
-		lines = append(lines, render.FitLine(m.skillsManagerStatus, m.width))
+		header = append(header, render.FitLine(m.skillsManagerStatus, m.width))
 	}
-	lines = append(lines, "")
+	header = append(header, "")
+	rows := make([]listRow, 0, len(items))
 	for i, item := range items {
 		prefix := "  "
 		if i == idx {
@@ -1918,13 +1704,19 @@ func (m Model) renderSkillsManager() string {
 				label = fmt.Sprintf("%s  (%d skills)", item.Label, len(source.Skills))
 			}
 		}
-		line := render.FitLine(fmt.Sprintf("%s%d. %s", prefix, i, label), m.width)
-		if i == idx {
-			line = render.Colorize(line, render.ANSISelected, m.useColor)
-		}
-		lines = append(lines, line)
+		rows = append(rows, listRow{
+			Text:     fmt.Sprintf("%s%d. %s", prefix, i, label),
+			Selected: i == idx,
+		})
 	}
-	return strings.Join(lines, "\n")
+	return menuListView{
+		Width:    m.width,
+		Height:   m.height,
+		Header:   header,
+		Rows:     rows,
+		Selected: idx,
+		UseColor: m.useColor,
+	}.Render()
 }
 
 func (m Model) renderSkillsInstallInput() string {
@@ -1932,7 +1724,8 @@ func (m Model) renderSkillsInstallInput() string {
 	if m.skillSelectionStatus != "" {
 		lines = append(lines, "", render.FitLine(m.skillSelectionStatus, m.width))
 	}
-	return strings.Join(lines, "\n")
+	lines = append(lines, renderHelp(m.width, helpKeyMapForView(helpKindInput)))
+	return renderViewport(m.width, m.height, strings.Join(lines, "\n"), 0)
 }
 
 func (m Model) renderSkillSelectionView() string {
@@ -1942,29 +1735,15 @@ func (m Model) renderSkillSelectionView() string {
 	}
 	idx := render.ClampSelectedIndex(m.skillsSelectedIndex, len(m.skillSelectionItems))
 	skillNameWidth, skillDescriptionWidth := skillListColumnWidths(m.width, render.DisplayWidth("  [ ]"), skillSelectionNames(m.skillSelectionItems))
-	selectedDescription := ""
-	selectedDescriptionLines := []string(nil)
-	if idx < len(m.skillSelectionItems) && m.skillSelectionItems[idx].Kind == "skill" {
-		selectedDescription = strings.TrimSpace(m.skillSelectionItems[idx].Description)
-		selectedDescriptionLines = wrappedSkillDescription(selectedDescription, m.width)
-	}
-	lines := []string{title, render.FitLine("Project: "+m.cwd, m.width)}
+	header := []string{title, render.FitLine("Project: "+m.cwd, m.width)}
 	if m.skillSelectionStatus != "" {
-		lines = append(lines, render.FitLine(m.skillSelectionStatus, m.width))
+		header = append(header, render.FitLine(m.skillSelectionStatus, m.width))
 	}
-	lines = append(lines, "", "Space toggles, Enter saves.", "")
-	headerLines := len(lines)
-	footerLines := 0
-	if len(selectedDescriptionLines) > 0 {
-		footerLines = 1 + len(selectedDescriptionLines)
-	}
-	maxItemRows := max(1, m.height-headerLines-footerLines)
-	start := skillSelectionWindowStart(len(m.skillSelectionItems), idx, maxItemRows)
-	visibleItems := m.skillSelectionItems[start:min(start+maxItemRows, len(m.skillSelectionItems))]
-	for vi, item := range visibleItems {
-		i := start + vi
+	header = append(header, "", "Space toggles, Enter saves.", "")
+	rows := make([]listRow, 0, len(m.skillSelectionItems))
+	for i, item := range m.skillSelectionItems {
 		if item.Kind == "header" {
-			lines = append(lines, render.FitLine(item.Label, m.width))
+			rows = append(rows, listRow{Text: item.Label})
 			continue
 		}
 		prefix := "  "
@@ -1975,35 +1754,31 @@ func (m Model) renderSkillSelectionView() string {
 		if item.Selected {
 			marker = "[✔]"
 		}
-		line := render.FitLine(renderSkillListLine(prefix+marker, item.Label, item.Description, skillNameWidth, skillDescriptionWidth), m.width)
-		if item.Selected {
-			line = render.Colorize(line, render.ANSISelectedConfig, m.useColor)
-		} else if i == idx {
-			line = render.Colorize(line, render.ANSISelected, m.useColor)
+		row := listRow{
+			Text:     renderSkillListLine(prefix+marker, item.Label, item.Description, skillNameWidth, skillDescriptionWidth),
+			Selected: item.Selected || i == idx,
+			Focused:  i == idx,
 		}
-		lines = append(lines, line)
+		if item.Selected {
+			row.Color = render.ANSISelectedConfig
+		} else if i == idx {
+			row.Color = render.ANSISelected
+		}
+		rows = append(rows, row)
 	}
-	if len(selectedDescriptionLines) > 0 {
-		lines = append(lines, "")
-		lines = append(lines, selectedDescriptionLines...)
-	}
-	return strings.Join(lines, "\n")
+	return listView{
+		Width:                m.width,
+		Height:               m.height,
+		Header:               header,
+		Rows:                 rows,
+		UseColor:             m.useColor,
+		DefaultSelectedColor: render.ANSISelected,
+		ViewportMode:         listViewportCenterSelection,
+	}.Render()
 }
 
 func skillSelectionWindowStart(itemCount int, selectedIndex int, maxRows int) int {
-	if itemCount <= 0 || maxRows <= 0 || itemCount <= maxRows {
-		return 0
-	}
-	idx := render.ClampSelectedIndex(selectedIndex, itemCount)
-	start := idx - maxRows/2
-	if start < 0 {
-		return 0
-	}
-	maxStart := itemCount - maxRows
-	if start > maxStart {
-		return maxStart
-	}
-	return start
+	return listWindowStart(itemCount, selectedIndex, maxRows, listViewportCenterSelection)
 }
 
 func skillSelectionNames(items []skillSelectionItem) []string {
@@ -2075,27 +1850,13 @@ func (m Model) renderSkillSourceDetail() string {
 		}
 	}
 	skillNameWidth, skillDescriptionWidth := skillListColumnWidths(m.width, render.DisplayWidth("  ")+numberWidth, skillSourceDetailNames(m.skillSourceDetailItems))
-	selectedDescription := ""
-	selectedDescriptionLines := []string(nil)
-	if idx < len(m.skillSourceDetailItems) && m.skillSourceDetailItems[idx].Kind == "skill" {
-		selectedDescription = strings.TrimSpace(m.skillSourceDetailItems[idx].Description)
-		selectedDescriptionLines = wrappedSkillDescription(selectedDescription, m.width)
-	}
-	lines := []string{render.FitLine(title, m.width)}
+	header := []string{render.FitLine(title, m.width)}
 	if m.skillDetailStatus != "" {
-		lines = append(lines, render.FitLine(m.skillDetailStatus, m.width))
+		header = append(header, render.FitLine(m.skillDetailStatus, m.width))
 	}
-	lines = append(lines, "")
-	headerLines := len(lines)
-	footerLines := 0
-	if len(selectedDescriptionLines) > 0 {
-		footerLines = 1 + len(selectedDescriptionLines)
-	}
-	maxItemRows := max(1, m.height-headerLines-footerLines)
-	start := skillSelectionWindowStart(len(m.skillSourceDetailItems), idx, maxItemRows)
-	visibleItems := m.skillSourceDetailItems[start:min(start+maxItemRows, len(m.skillSourceDetailItems))]
-	for vi, item := range visibleItems {
-		i := start + vi
+	header = append(header, "")
+	rows := make([]listRow, 0, len(m.skillSourceDetailItems))
+	for i, item := range m.skillSourceDetailItems {
 		prefix := "  "
 		if i == idx {
 			prefix = "> "
@@ -2105,60 +1866,49 @@ func (m Model) renderSkillSourceDetail() string {
 		if item.Kind == "skill" {
 			line = renderSkillListLine(prefix+number, item.Label, item.Description, skillNameWidth, skillDescriptionWidth)
 		}
-		line = render.FitLine(line, m.width)
-		if i == idx {
-			line = render.Colorize(line, render.ANSISelected, m.useColor)
-		}
-		lines = append(lines, line)
+		rows = append(rows, listRow{
+			Text:     line,
+			Selected: i == idx,
+		})
 	}
-	if len(selectedDescriptionLines) > 0 {
-		lines = append(lines, "")
-		lines = append(lines, selectedDescriptionLines...)
-	}
-	return strings.Join(lines, "\n")
-}
-
-func wrappedSkillDescription(description string, width int) []string {
-	description = strings.TrimSpace(description)
-	if description == "" {
-		return nil
-	}
-	available := max(1, width-render.DisplayWidth("Description: "))
-	wrapped := render.WrapTextPreserveNewlines(description, available)
-	if len(wrapped) == 0 {
-		return nil
-	}
-	lines := make([]string, 0, len(wrapped))
-	for i, line := range wrapped {
-		prefix := "             "
-		if i == 0 {
-			prefix = "Description: "
-		}
-		lines = append(lines, render.FitLine(prefix+line, width))
-	}
-	return lines
+	return listView{
+		Width:                m.width,
+		Height:               m.height,
+		Header:               header,
+		Rows:                 rows,
+		UseColor:             m.useColor,
+		DefaultSelectedColor: render.ANSISelected,
+		ViewportMode:         listViewportCenterSelection,
+	}.Render()
 }
 
 func (m Model) renderSkillSourceRemoveConfirm() string {
 	idx := render.ClampSelectedIndex(m.skillRemoveSelectedIndex, 2)
-	lines := []string{"Remove source", render.FitLine(fmt.Sprintf("Installed skills: %d", m.skillRemoveImpact.InstalledSkills), m.width), render.FitLine(fmt.Sprintf("Global links to remove: %d", m.skillRemoveImpact.GlobalEnabledSkills), m.width), render.FitLine(fmt.Sprintf("Current project links to remove: %d", m.skillRemoveImpact.CurrentProjectSkills), m.width), render.FitLine(fmt.Sprintf("Other project paths to clean: %d", m.skillRemoveImpact.OtherProjectPathCount), m.width)}
+	header := []string{"Remove source", render.FitLine(fmt.Sprintf("Installed skills: %d", m.skillRemoveImpact.InstalledSkills), m.width), render.FitLine(fmt.Sprintf("Global links to remove: %d", m.skillRemoveImpact.GlobalEnabledSkills), m.width), render.FitLine(fmt.Sprintf("Current project links to remove: %d", m.skillRemoveImpact.CurrentProjectSkills), m.width), render.FitLine(fmt.Sprintf("Other project paths to clean: %d", m.skillRemoveImpact.OtherProjectPathCount), m.width)}
 	if m.skillRemoveStatus != "" {
-		lines = append(lines, render.FitLine(m.skillRemoveStatus, m.width))
+		header = append(header, render.FitLine(m.skillRemoveStatus, m.width))
 	}
-	lines = append(lines, "")
+	header = append(header, "")
 	options := []string{"Confirm remove", "Cancel"}
+	rows := make([]listRow, 0, len(options))
 	for i, option := range options {
 		prefix := "  "
 		if i == idx {
 			prefix = "> "
 		}
-		line := render.FitLine(fmt.Sprintf("%s%d. %s", prefix, i, option), m.width)
-		if i == idx {
-			line = render.Colorize(line, render.ANSISelected, m.useColor)
-		}
-		lines = append(lines, line)
+		rows = append(rows, listRow{
+			Text:     fmt.Sprintf("%s%d. %s", prefix, i, option),
+			Selected: i == idx,
+		})
 	}
-	return strings.Join(lines, "\n")
+	return menuListView{
+		Width:    m.width,
+		Height:   m.height,
+		Header:   header,
+		Rows:     rows,
+		Selected: idx,
+		UseColor: m.useColor,
+	}.Render()
 }
 
 func min(a, b int) int {
